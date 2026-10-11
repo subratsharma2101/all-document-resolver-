@@ -1,0 +1,8 @@
+android-bundle/
+android-export.log
+native-prebuild.log
+unit-tests.log
+native-modules.json
+toolchain/
+*.apk
+native-backup*/

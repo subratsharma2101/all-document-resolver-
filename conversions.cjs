@@ -4,6 +4,11 @@ const MAX_OUTPUT_BYTES = 25 * 1024 * 1024;
 const MAX_CONVERT_IMAGES = 50;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_TEXT_CHARS = 500000;
+// A US Letter page holds an image roughly 558x738 pt. Rendering at ~2x that (about
+// 200 dpi) stays crisp on screen and in print while keeping each embedded photo small,
+// so several images fit comfortably under MAX_OUTPUT_BYTES.
+const PDF_IMAGE_MAX_DIMENSION = 1600;
+const PDF_IMAGE_QUALITY = 0.7;
 
 // US Letter at 72 dpi, with a comfortable margin.
 const PAGE = { width: 612, height: 792, margin: 54 };
@@ -28,35 +33,35 @@ function detectImageFormat(bytes) {
   throw new ConversionError('UNSUPPORTED_IMAGE', 'Only PNG and JPG images can be turned into a PDF. Convert other formats first.');
 }
 
+// Decide how to downscale an image so its longest side fits PDF_IMAGE_MAX_DIMENSION,
+// preserving aspect ratio. expo-image-manipulator keeps the ratio when only one axis
+// is given, so we constrain the larger axis. Returns null when the image already fits
+// (never upscale — that only adds bytes without adding detail).
+function resizeForPdf(width, height, max = PDF_IMAGE_MAX_DIMENSION) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  const longest = Math.max(width, height);
+  if (longest <= max) return null;
+  return width >= height ? { width: max } : { height: max };
+}
+
 // Break text into lines that fit maxWidth at the given font size, honoring existing
 // newlines and splitting over-long words so nothing overflows the page.
 function wrapLines(text, font, fontSize, maxWidth) {
   const lines = [];
-  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+  for (const rawLine of text.replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n')) {
     if (rawLine.length === 0) { lines.push(''); continue; }
     let current = '';
     for (const word of rawLine.split(/(\s+)/)) {
       if (word === '') continue;
       const candidate = current + word;
-      if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth || current === '') {
-        // A single word longer than the line: hard-split it by characters.
-        if (current === '' && font.widthOfTextAtSize(word, fontSize) > maxWidth) {
-          let chunk = '';
-          for (const char of word) {
-            if (font.widthOfTextAtSize(chunk + char, fontSize) > maxWidth && chunk !== '') {
-              lines.push(chunk);
-              chunk = char;
-            } else {
-              chunk += char;
-            }
-          }
-          current = chunk;
-        } else {
-          current = candidate;
+      if (font.widthOfTextAtSize(candidate, fontSize) <= maxWidth) { current = candidate; continue; }
+      if (current) { lines.push(current.trimEnd()); current = ''; }
+      // This also handles a long word after a short word, not just at line start.
+      for (const char of word.trimStart()) {
+        if (current && font.widthOfTextAtSize(current + char, fontSize) > maxWidth) {
+          lines.push(current); current = '';
         }
-      } else {
-        lines.push(current.trimEnd());
-        current = word.trimStart();
+        current += char;
       }
     }
     lines.push(current.trimEnd());
@@ -68,6 +73,7 @@ async function buildPdfFromText(text, options = {}) {
   check(typeof text === 'string' && text.trim().length > 0, 'EMPTY_TEXT', 'There is no text to turn into a PDF.');
   check(text.length <= MAX_TEXT_CHARS, 'TEXT_TOO_LONG', 'This text is too long to convert. Split it into smaller files.');
 
+  check(Number.isFinite(options.fontSize ?? 12), 'INVALID_FONT_SIZE', 'Choose a finite font size.');
   const fontSize = Math.max(8, Math.min(24, options.fontSize ?? 12));
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
@@ -102,6 +108,12 @@ async function buildPdfFromText(text, options = {}) {
 async function buildPdfFromImages(images) {
   check(Array.isArray(images) && images.length > 0, 'NO_IMAGES', 'Choose at least one image to make a PDF.');
   check(images.length <= MAX_CONVERT_IMAGES, 'TOO_MANY_IMAGES', `You can combine up to ${MAX_CONVERT_IMAGES} images at once.`);
+  let total = 0;
+  for (const bytes of images) {
+    detectImageFormat(bytes);
+    total += bytes.byteLength;
+    check(total <= MAX_OUTPUT_BYTES, 'INPUT_TOO_LARGE', 'Combined images exceed 25 MiB. Choose fewer or smaller images.');
+  }
 
   const pdf = await PDFDocument.create();
   for (const bytes of images) {
@@ -129,5 +141,6 @@ async function buildPdfFromImages(images) {
 
 module.exports = {
   MAX_OUTPUT_BYTES, MAX_CONVERT_IMAGES, MAX_IMAGE_BYTES, MAX_TEXT_CHARS,
-  ConversionError, detectImageFormat, wrapLines, buildPdfFromText, buildPdfFromImages,
+  PDF_IMAGE_MAX_DIMENSION, PDF_IMAGE_QUALITY,
+  ConversionError, detectImageFormat, resizeForPdf, wrapLines, buildPdfFromText, buildPdfFromImages,
 };

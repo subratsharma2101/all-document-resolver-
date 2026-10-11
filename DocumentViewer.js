@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
-import { Image, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Image } from 'expo-image';
 import PdfViewer from './PdfViewer';
 import { formatSize } from './fileUtils.cjs';
 import { useTheme } from './theme';
@@ -19,7 +20,7 @@ export default function DocumentViewer({ doc }) {
         minimumZoomScale={1}
         centerContent
       >
-        <Image accessibilityLabel={doc.name} source={{ uri: doc.uri }} style={styles.image} resizeMode="contain" />
+        <Image accessibilityLabel={doc.name} source={{ uri: doc.uri }} style={styles.image} contentFit="contain" cachePolicy="none" autoplay={false} allowDownscaling />
       </ScrollView>
     );
   }

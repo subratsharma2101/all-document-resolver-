@@ -1,71 +1,94 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { useColorScheme } from 'react-native';
+import { Platform, StyleSheet, useColorScheme } from 'react-native';
 import { File, Paths } from 'expo-file-system';
+import * as SystemUI from 'expo-system-ui';
 
-// Two palettes sharing the same token names so every screen can theme by reference
-// instead of hardcoded hex. Light is the mockup-inspired white/blue look; dark keeps
-// the original deep-slate feel. File-type accents are shared across both.
+// One spacing/radius/type scale for every screen. Ad-hoc per-screen numbers were the
+// main reason the UI looked busy, so layout values now come from here instead.
+export const space = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24, xxl: 32 };
+export const radius = { sm: 10, md: 14, lg: 20, pill: 999 };
+export const type = {
+  display: { fontSize: 26, lineHeight: 32, fontWeight: '700', letterSpacing: -0.6 },
+  title: { fontSize: 20, lineHeight: 26, fontWeight: '700', letterSpacing: -0.3 },
+  heading: { fontSize: 16, lineHeight: 22, fontWeight: '600' },
+  body: { fontSize: 14, lineHeight: 21 },
+  label: { fontSize: 13, lineHeight: 18, fontWeight: '600' },
+  caption: { fontSize: 12, lineHeight: 17 },
+};
+export const hairline = StyleSheet.hairlineWidth;
+
+// Native press feedback. Android gets a real ripple; iOS falls back to opacity.
+export function rippleFor(color) {
+  return Platform.OS === 'android' ? { color, borderless: false, foreground: true } : undefined;
+}
+export const pressedOpacity = (pressed, disabled) => (disabled ? 0.4 : pressed && Platform.OS !== 'android' ? 0.6 : 1);
+
+// Shared semantic colors keep the workspace, editors and reader consistent.
 const accents = {
-  pdf: '#f4553d',
-  image: '#2ea36b',
-  text: '#3f7ef4',
-  signature: '#a065f0',
+  pdf: '#b25741',
+  image: '#1f7a64',
+  text: '#4a67a6',
+  signature: '#85619e',
 };
 
 const light = {
   name: 'light',
-  bg: '#f5f7fb',
+  bg: '#f6f7f7',
   surface: '#ffffff',
-  surfaceAlt: '#eef1f7',
+  surfaceAlt: '#f0f2f2',
   card: '#ffffff',
-  border: '#e3e8f0',
-  text: '#12151c',
-  textMuted: '#5c6472',
-  textFaint: '#8a92a2',
-  primary: '#2f6bff',
+  border: '#e3e7e6',
+  text: '#16211f',
+  textMuted: '#5e6b68',
+  textFaint: '#8a9592',
+  primary: '#146b57',
   primaryText: '#ffffff',
-  onPrimarySurface: '#e8f0ff',
-  chip: '#eef1f7',
-  chipText: '#3a4252',
-  chipOn: '#2f6bff',
+  onPrimarySurface: '#e7f1ed',
+  chip: '#f0f2f2',
+  chipText: '#43544f',
+  chipOn: '#146b57',
   chipTextOn: '#ffffff',
-  danger: '#d63a4f',
-  dangerBg: '#fdecef',
-  success: '#1f9d63',
-  warn: '#b8791b',
-  overlayViewer: '#f0f2f7',
-  scrim: '#0b0e14aa',
+  danger: '#c33a4c',
+  dangerBg: '#fbecee',
+  success: '#1d8f5c',
+  warn: '#a9711a',
+  overlayViewer: '#eceeee',
+  scrim: '#10181699',
+  ripple: '#16211f1f',
+  skeleton: '#e9ecec',
   statusBar: 'dark',
-  shadow: '#1a2b5233',
+  shadow: 'transparent',
   accents,
 };
 
 const dark = {
   name: 'dark',
-  bg: '#0f1115',
-  surface: '#191d26',
-  surfaceAlt: '#20242f',
-  card: '#191d26',
-  border: '#252a35',
-  text: '#f4f5f8',
-  textMuted: '#9299a8',
-  textFaint: '#687384',
-  primary: '#4f8cff',
-  primaryText: '#ffffff',
-  onPrimarySurface: '#1a2233',
-  chip: '#252a35',
-  chipText: '#c7ccd6',
-  chipOn: '#4f8cff',
-  chipTextOn: '#ffffff',
-  danger: '#ff6b6b',
-  dangerBg: '#34202a',
-  success: '#74cca6',
-  warn: '#e7c979',
-  overlayViewer: '#0f1115',
-  scrim: '#0009',
+  bg: '#0f1514',
+  surface: '#161d1c',
+  surfaceAlt: '#1f2726',
+  card: '#161d1c',
+  border: '#283130',
+  text: '#edf1f0',
+  textMuted: '#9ba7a4',
+  textFaint: '#7c8886',
+  primary: '#7fd4b4',
+  primaryText: '#0d2a24',
+  onPrimarySurface: '#1c2f2a',
+  chip: '#1f2726',
+  chipText: '#c2cfcb',
+  chipOn: '#7fd4b4',
+  chipTextOn: '#0d2a24',
+  danger: '#f08080',
+  dangerBg: '#2c1d20',
+  success: '#6fc8a2',
+  warn: '#dcc07a',
+  overlayViewer: '#0f1514',
+  scrim: '#000000b3',
+  ripple: '#edf1f026',
+  skeleton: '#1f2726',
   statusBar: 'light',
-  shadow: '#00000000',
-  accents,
+  shadow: 'transparent',
+  accents: { pdf: '#e4947d', image: '#7fd4b4', text: '#9ab2e2', signature: '#bfa0dd' },
 };
 
 export const THEMES = { light, dark };
@@ -76,7 +99,7 @@ function loadSavedMode() {
   try {
     const file = settingsFile();
     if (!file.exists) return null;
-    const saved = JSON.parse(file.text());
+    const saved = JSON.parse(file.textSync());
     return saved.theme === 'light' || saved.theme === 'dark' ? saved.theme : null;
   } catch {
     return null; // A missing or corrupt settings file just falls back to the system scheme.
@@ -87,7 +110,7 @@ function saveMode(mode) {
   try {
     const file = settingsFile();
     let data = {};
-    if (file.exists) { try { data = JSON.parse(file.text()); } catch { data = {}; } }
+    if (file.exists) { try { data = JSON.parse(file.textSync()); } catch { data = {}; } }
     data.theme = mode;
     file.write(JSON.stringify(data));
   } catch { /* Persisting the preference is best effort; the app still themes in-memory. */ }
@@ -111,6 +134,13 @@ export function ThemeProvider({ children }) {
     if (!explicit.current && mode !== null) setMode(systemScheme === 'light' ? 'light' : 'dark');
   }, [systemScheme]);
 
+  // Keep the root view behind React in sync, so theme switches and screen
+  // transitions never flash the opposite background.
+  useEffect(() => {
+    if (mode === null) return;
+    SystemUI.setBackgroundColorAsync(THEMES[mode].bg).catch(() => {});
+  }, [mode]);
+
   const value = useMemo(() => {
     const active = mode === 'light' ? 'light' : 'dark';
     return {
@@ -118,12 +148,10 @@ export function ThemeProvider({ children }) {
       mode: active,
       ready: mode !== null,
       toggle: () => {
-        setMode(current => {
-          const next = current === 'light' ? 'dark' : 'light';
-          explicit.current = true;
-          saveMode(next);
-          return next;
-        });
+        const next = active === 'light' ? 'dark' : 'light';
+        explicit.current = true;
+        saveMode(next);
+        setMode(next);
       },
     };
   }, [mode]);

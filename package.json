@@ -3,13 +3,17 @@
   "version": "1.0.0",
   "main": "index.js",
   "dependencies": {
-    "expo": "~57.0.24",
+    "expo": "~57.0.25",
     "expo-asset": "~57.0.18",
+    "expo-build-properties": "~57.0.22",
     "expo-document-picker": "~57.0.2",
     "expo-file-system": "~57.0.7",
-    "expo-image-manipulator": "~57.0.19",
-    "expo-sharing": "~57.0.21",
+    "expo-image": "~57.0.5",
+    "expo-image-manipulator": "~57.0.20",
+    "expo-sharing": "~57.0.22",
     "expo-status-bar": "~57.0.1",
+    "expo-system-ui": "~57.0.4",
+    "image-size": "^2.0.4",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.8.69",
     "react": "19.2.3",
@@ -21,17 +25,23 @@
   },
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
     "test": "node --test tests/*.test.cjs",
     "test:pdf-viewer": "node --test tests/pdfViewer.browser.cjs",
     "check:android": "expo export --platform android",
-    "licenses": "node scripts/generate-notices.cjs"
+    "licenses": "node scripts/generate-notices.cjs",
+    "test:browsers": "node --test tests/pdfViewer.browser.cjs tests/textImage.browser.cjs",
+    "check:release-config": "node scripts/check-release-config.cjs"
   },
   "private": true,
+  "overrides": {
+    "xcode": {
+      "uuid": "11.1.1"
+    }
+  },
   "devDependencies": {
-    "eas-cli": "^24.7.0",
     "playwright": "^1.63.0"
   }
 }

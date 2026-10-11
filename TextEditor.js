@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { newWorkingFile, removeWorkingFile } from './fileService';
 import { copyName, formatSize, utf8Size, LIMITS } from './fileUtils.cjs';
-import { buildPdfFromText } from './conversions.cjs';
+import { createTextPdf, removeGeneratedFile } from './nativeFileTools';
+import { readDraft } from './draftStorage';
+import useDraftAutosave from './useDraftAutosave';
 import TextImageRenderer from './TextImageRenderer';
-import { useTheme } from './theme';
+import { useTheme, hairline, radius, space, type } from './theme';
 
 // Swap a filename's extension, e.g. notes.txt -> notes.pdf.
 function withExtension(name, ext) {
@@ -13,46 +15,58 @@ function withExtension(name, ext) {
   return `${dot > 0 ? clean.slice(0, dot) : clean}.${ext}`;
 }
 
-export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange }) {
+export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange, onDraftChange, onDraftStored }) {
   const { theme } = useTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
-  const [text, setText] = useState(doc.text || '');
+  const [restored] = useState(() => readDraft(doc));
+  const [text, setText] = useState(restored?.text ?? doc.text ?? '');
   const [busy, setBusy] = useState(false);
   const [fontSize, setFontSize] = useState(15);
   const [limitNotice, setLimitNotice] = useState('');
   const [rendering, setRendering] = useState(false); // true while the text->image WebView runs
-  const dirty = text !== (doc.text || '');
+  const [revision, setRevision] = useState(0);
+  const [savedFormats, setSavedFormats] = useState({});
+  const locked = useRef(false);
+  const isSaved = format => savedFormats[format]?.revision === revision;
+  const saveLabel = (format, label) => isSaved(format) ? (savedFormats[format].phone ? `${label} saved` : `${label} in Exports`) : `Save ${label}`;
+  const recordSave = (format, result) => setSavedFormats(previous => ({ ...previous, [format]: { revision, phone: result?.saveStatus === 'saved' } }));
+  const dirty = text !== (doc.text || '') && !Object.values(savedFormats).some(saved => saved.revision === revision);
+  const autosave = useDraftAutosave({ doc, dirty, revision: text, snapshot: { text }, restored, onDraftChange, onDraftStored });
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
-  const setWorking = (value) => { setBusy(value); onBusyChange?.(value); };
+  const setWorking = (value) => { locked.current = value; setBusy(value); onBusyChange?.(value); };
 
   async function save() {
-    if (busy) return;
+    if (locked.current || isSaved('text')) return;
     setWorking(true);
-    const file = newWorkingFile(copyName(doc.name));
+    let file;
     try {
+      file = newWorkingFile(copyName(doc.name));
       file.write(text);
-      await onExport({ uri: file.uri, name: copyName(doc.name), mimeType: doc.mimeType || 'text/plain' });
+      const saved = await onExport({ uri: file.uri, name: copyName(doc.name), mimeType: doc.mimeType || 'text/plain' });
+      recordSave('text', saved);
+      await autosave.clear();
     } catch (error) {
       Alert.alert('Could not export', error.message);
     } finally {
-      removeWorkingFile(file.uri);
+      if (file) removeWorkingFile(file.uri);
       setWorking(false);
     }
   }
 
   async function saveAsPdf() {
-    if (busy || !text.trim()) return;
+    if (locked.current || isSaved('pdf') || !text.trim()) return;
     setWorking(true);
-    const file = newWorkingFile(withExtension(doc.name, 'pdf'));
+    let file;
     try {
-      const bytes = await buildPdfFromText(text);
-      file.write(bytes);
-      await onExport({ uri: file.uri, name: withExtension(doc.name, 'pdf'), mimeType: 'application/pdf' });
+      file = await createTextPdf(text, withExtension(doc.name, 'pdf'));
+      const saved = await onExport({ uri: file.uri, name: withExtension(doc.name, 'pdf'), mimeType: 'application/pdf' });
+      recordSave('pdf', saved);
+      await autosave.clear();
     } catch (error) {
       Alert.alert('Could not make PDF', error.message);
     } finally {
-      removeWorkingFile(file.uri);
+      if (file) removeGeneratedFile(file.uri);
       setWorking(false);
     }
   }
@@ -61,14 +75,17 @@ export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange 
   // receive the base64 PNG (or an error) and finish the export.
   async function onImageRendered(base64) {
     setRendering(false);
-    const file = newWorkingFile(withExtension(doc.name, 'png'));
+    let file;
     try {
+      file = newWorkingFile(withExtension(doc.name, 'png'));
       file.write(base64, { encoding: 'base64' });
-      await onExport({ uri: file.uri, name: withExtension(doc.name, 'png'), mimeType: 'image/png' });
+      const saved = await onExport({ uri: file.uri, name: withExtension(doc.name, 'png'), mimeType: 'image/png' });
+      recordSave('image', saved);
+      await autosave.clear();
     } catch (error) {
       Alert.alert('Could not make image', error.message);
     } finally {
-      removeWorkingFile(file.uri);
+      if (file) removeWorkingFile(file.uri);
       setWorking(false);
     }
   }
@@ -80,7 +97,7 @@ export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange 
   }
 
   function saveAsImage() {
-    if (busy || !text.trim()) return;
+    if (locked.current || isSaved('image') || !text.trim()) return;
     setWorking(true);
     setRendering(true); // Mounts the off-screen renderer, which calls back when done.
   }
@@ -97,21 +114,22 @@ export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange 
     <TextInput accessibilityLabel="Document text" style={[styles.editor, { fontSize, lineHeight: fontSize * 1.6 }]}
       value={text} onChangeText={value => {
         if (utf8Size(value) > LIMITS.text) { setLimitNotice(`Text is limited to ${formatSize(LIMITS.text)}. The last change was not applied.`); return; }
-        setLimitNotice(''); setText(value);
+        setLimitNotice(''); setText(value); setRevision(current => current + 1);
       }} multiline textAlignVertical="top" autoCorrect={false}
       autoCapitalize="none" editable={!busy} selectionColor={theme.primary} placeholderTextColor={theme.textFaint} />
     <View style={styles.footer}>
+      {!!autosave.status && <Text accessibilityLiveRegion="polite" style={styles.muted}>{autosave.status}</Text>}
       {!!limitNotice && <Text accessibilityRole="alert" style={{ color: theme.danger }}>{limitNotice}</Text>}
       <Text style={styles.muted}>Original stays untouched. Save as a new text file, PDF, or image.</Text>
-      <Pressable accessibilityRole="button" disabled={busy} onPress={save} style={[styles.save, busy && { opacity: 0.5 }]}>
-        <Text style={styles.saveText}>{busy ? 'Working...' : 'Save a copy'}</Text>
+      <Pressable accessibilityRole="button" accessibilityState={{ disabled: busy || isSaved('text') }} disabled={busy || isSaved('text')} onPress={save} style={[styles.save, (busy || isSaved('text')) && { opacity: 0.5 }]}>
+        <Text style={styles.saveText}>{busy ? 'Working...' : saveLabel('text', 'text')}</Text>
       </Pressable>
       <View style={styles.convertRow}>
-        <Pressable accessibilityRole="button" disabled={busy || !text.trim()} onPress={saveAsPdf} style={[styles.convert, (busy || !text.trim()) && { opacity: 0.5 }]}>
-          <Text style={styles.convertText}>Save as PDF</Text>
+        <Pressable accessibilityRole="button" accessibilityState={{ disabled: busy || !text.trim() || isSaved('pdf') }} disabled={busy || !text.trim() || isSaved('pdf')} onPress={saveAsPdf} style={[styles.convert, (busy || !text.trim() || isSaved('pdf')) && { opacity: 0.5 }]}>
+          <Text style={styles.convertText}>{saveLabel('pdf', 'PDF')}</Text>
         </Pressable>
-        <Pressable accessibilityRole="button" disabled={busy || !text.trim()} onPress={saveAsImage} style={[styles.convert, (busy || !text.trim()) && { opacity: 0.5 }]}>
-          <Text style={styles.convertText}>Save as image</Text>
+        <Pressable accessibilityRole="button" accessibilityState={{ disabled: busy || !text.trim() || isSaved('image') }} disabled={busy || !text.trim() || isSaved('image')} onPress={saveAsImage} style={[styles.convert, (busy || !text.trim() || isSaved('image')) && { opacity: 0.5 }]}>
+          <Text style={styles.convertText}>{saveLabel('image', 'image')}</Text>
         </Pressable>
       </View>
     </View>
@@ -121,13 +139,13 @@ export default function TextEditor({ doc, onExport, onDirtyChange, onBusyChange 
 
 function makeStyles(t) {
   return StyleSheet.create({
-    root: { flex: 1, backgroundColor: t.bg }, toolbar: { padding: 16, flexDirection: 'row', alignItems: 'center', gap: 8 },
-    title: { color: t.text, fontSize: 19, fontWeight: '700' }, muted: { color: t.textMuted, fontSize: 12, lineHeight: 18 },
-    small: { backgroundColor: t.surfaceAlt, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 11, minHeight: 44, justifyContent: 'center' }, smallText: { color: t.text, fontWeight: '700' },
-    editor: { flex: 1, marginHorizontal: 16, padding: 16, backgroundColor: t.surface, borderRadius: 14, borderWidth: 1, borderColor: t.border, color: t.text, fontFamily: 'monospace' },
-    footer: { padding: 16, gap: 12 }, save: { backgroundColor: t.primary, borderRadius: 14, padding: 15, alignItems: 'center', minHeight: 50, justifyContent: 'center' }, saveText: { color: t.primaryText, fontWeight: '700', fontSize: 15 },
-    convertRow: { flexDirection: 'row', gap: 10 },
-    convert: { flex: 1, backgroundColor: t.surfaceAlt, borderRadius: 14, padding: 14, alignItems: 'center', minHeight: 48, justifyContent: 'center', borderWidth: 1, borderColor: t.border },
-    convertText: { color: t.text, fontWeight: '600', fontSize: 14 },
+    root: { flex: 1, backgroundColor: t.bg }, toolbar: { padding: space.lg, flexDirection: 'row', alignItems: 'center', gap: space.sm },
+    title: { ...type.title, color: t.text }, muted: { ...type.caption, color: t.textMuted },
+    small: { backgroundColor: t.surfaceAlt, borderRadius: radius.sm, paddingHorizontal: space.md, paddingVertical: space.sm, minHeight: 44, justifyContent: 'center' }, smallText: { ...type.label, color: t.text },
+    editor: { flex: 1, marginHorizontal: space.lg, padding: space.lg, backgroundColor: t.surface, borderRadius: radius.md, borderWidth: hairline, borderColor: t.border, color: t.text, fontFamily: 'monospace' },
+    footer: { padding: space.lg, gap: space.md }, save: { backgroundColor: t.primary, borderRadius: radius.md, padding: space.md, alignItems: 'center', minHeight: 48, justifyContent: 'center' }, saveText: { ...type.label, color: t.primaryText },
+    convertRow: { flexDirection: 'row', gap: space.sm },
+    convert: { flex: 1, backgroundColor: t.surfaceAlt, borderRadius: radius.md, padding: space.md, alignItems: 'center', minHeight: 48, justifyContent: 'center', borderWidth: hairline, borderColor: t.border },
+    convertText: { ...type.label, color: t.text },
   });
 }

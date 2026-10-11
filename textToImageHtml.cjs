@@ -30,19 +30,21 @@ function buildTextImageHtml(text, options = {}) {
   var post=function(m){window.ReactNativeWebView&&window.ReactNativeWebView.postMessage(JSON.stringify(m));};
   try{
     var text=${scriptValue(String(text))};
-    var fontSize=${Number(o.fontSize) || 24};
-    var padding=${Number(o.padding) || 40};
-    var maxWidth=${Number(o.maxWidth) || 1080};
+    if(text.length>20000)throw new Error('Too much text for one image. Save as PDF or split the text.');
+    var fontSize=${Math.max(8, Math.min(72, Number(o.fontSize) || 24))};
+    var padding=${Math.max(0, Math.min(100, Number(o.padding) || 40))};
+    var maxWidth=${Math.max(320, Math.min(2048, Number(o.maxWidth) || 1080))};
     var bg=${scriptValue(bg)};
     var fg=${scriptValue(fg)};
-    var ratio=Math.min(window.devicePixelRatio||1,3);
+    var ratio=Math.min(window.devicePixelRatio||1,2);
     var measure=document.createElement('canvas').getContext('2d');
     var font=fontSize+'px system-ui,-apple-system,sans-serif';
     measure.font=font;
     var lineHeight=Math.round(fontSize*1.5);
     var contentWidth=maxWidth-padding*2;
     var lines=[];
-    var paragraphs=text.replace(/\\r\\n?/g,'\\n').split('\\n');
+    var paragraphs=text.replace(/\\r\\n?/g,'\\n').replace(/\\t/g,'    ').split('\\n');
+    var segmenter=typeof Intl.Segmenter==='function'?new Intl.Segmenter(undefined,{granularity:'grapheme'}):null;
     for(var p=0;p<paragraphs.length;p++){
       var words=paragraphs[p].split(/(\\s+)/);
       var line='';
@@ -50,20 +52,19 @@ function buildTextImageHtml(text, options = {}) {
         var word=words[w];
         if(word==='')continue;
         var test=line+word;
-        if(measure.measureText(test).width<=contentWidth||line===''){
-          if(line===''&&measure.measureText(word).width>contentWidth){
-            var chunk='';
-            for(var c=0;c<word.length;c++){
-              if(measure.measureText(chunk+word[c]).width>contentWidth&&chunk!==''){lines.push(chunk);chunk=word[c];}
-              else{chunk+=word[c];}
-            }
-            line=chunk;
-          }else{line=test;}
-        }else{lines.push(line.replace(/\\s+$/,''));line=word.replace(/^\\s+/,'');}
+        if(measure.measureText(test).width<=contentWidth){line=test;continue;}
+        if(line){lines.push(line.replace(/\\s+$/,''));line='';}
+        var rest=word.replace(/^\\s+/,'');
+        var characters=segmenter?Array.from(segmenter.segment(rest),function(s){return s.segment;}):Array.from(rest);
+        for(var c=0;c<characters.length;c++){
+          if(line&&measure.measureText(line+characters[c]).width>contentWidth){lines.push(line);line='';}
+          line+=characters[c];
+        }
       }
       lines.push(line.replace(/\\s+$/,''));
     }
     var height=padding*2+Math.max(lineHeight,lines.length*lineHeight);
+    if(height*ratio>8192||maxWidth*height*ratio*ratio>16000000)throw new Error('Text is too tall for one image. Save as PDF or split the text.');
     var canvas=document.createElement('canvas');
     canvas.width=Math.round(maxWidth*ratio);
     canvas.height=Math.round(height*ratio);
@@ -73,6 +74,7 @@ function buildTextImageHtml(text, options = {}) {
     ctx.fillStyle=fg;ctx.textBaseline='top';ctx.font=font;
     for(var i=0;i<lines.length;i++){ctx.fillText(lines[i],padding,padding+i*lineHeight);}
     var url=canvas.toDataURL('image/png');
+    if(!url.startsWith('data:image/png;base64,'))throw new Error('The device could not render this image. Use less text.');
     post({type:'png',base64:url.split(',')[1],width:canvas.width,height:canvas.height});
   }catch(e){post({type:'error',message:String(e&&e.message?e.message:e)});}
 })();

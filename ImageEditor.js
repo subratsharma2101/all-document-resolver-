@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Image, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, AppState, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Image } from 'expo-image';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import { File } from 'expo-file-system';
 import { formatSize } from './fileUtils.cjs';
-import { useTheme } from './theme';
+import { useTheme, hairline, radius, space, type } from './theme';
+import { inspectImageFile, loadBoundedImage } from './safeImage';
+import { WORKING_IMAGE_EDGE } from './imageSafety.cjs';
+import { ensureWorkingSpace, newWorkingFile, removeWorkingFile } from './fileService';
+import { readDraft } from './draftStorage';
+import useDraftAutosave from './useDraftAutosave';
 import { FORMATS, formatFor, guardDimensions, ImageOperationError, outputName, resolveMaxWidth, targetBytes, searchQuality, scaleWidths } from './imageOperations.cjs';
 
 const FORMAT_KEYS = ['jpeg', 'png', 'webp'];
@@ -15,9 +21,10 @@ const defaultFormat = (mimeType = '', name = '') => {
   return 'jpeg';
 };
 
-export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange }) {
+export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange, onDraftChange, onDraftStored }) {
   const { theme } = useTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  const [restored] = useState(() => readDraft(doc));
   const [format, setFormat] = useState(defaultFormat(doc.mimeType, doc.name));
   const [targetKb, setTargetKb] = useState('');
   const [maxWidth, setMaxWidth] = useState('');
@@ -30,15 +37,18 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
   const [notice, setNotice] = useState('');
 
   const cancelled = useRef(false);
+  const locked = useRef(false);
   const resultUri = useRef(null);
   const temps = useRef(new Set());
+  const autosave = useDraftAutosave({ doc, dirty: !!result, revision: result?.uri,
+    snapshot: { uri: result?.uri, options: result ? { ...result, uri: undefined } : {} }, restored, onDraftChange, onDraftStored });
 
-  const clearTemps = (keep) => {
+  const clearTemps = (keep, preserve) => {
     for (const uri of temps.current) {
-      if (uri === keep) continue;
+      if (uri === keep || uri === preserve) continue;
       try { const file = new File(uri); if (file.exists) file.delete(); } catch { /* Best effort cleanup. */ }
     }
-    temps.current = keep ? new Set([keep]) : new Set();
+    temps.current = new Set([keep, preserve].filter(Boolean));
   };
   const dropResult = () => {
     if (resultUri.current) { try { const f = new File(resultUri.current); if (f.exists) f.delete(); } catch { /* Best effort. */ } }
@@ -46,50 +56,76 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
     setResult(null);
   };
 
-  // Decode the original once to read dimensions and enforce the pixel guard early.
+  // Parse a bounded header before any decode; never load a full bitmap just for dimensions.
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const ref = await ImageManipulator.manipulate(doc.uri).renderAsync();
-        guardDimensions(ref.width, ref.height);
-        if (alive) setSource({ width: ref.width, height: ref.height });
+        const metadata = doc.imageMetadata || inspectImageFile(doc.uri);
+        if (restored && FORMAT_KEYS.includes(restored.options?.format)) {
+          const copy = newWorkingFile(`recovered.${restored.options.format}`);
+          try {
+            await new File(restored.uri).copy(copy);
+            if (!alive) { removeWorkingFile(copy.uri); return; }
+            const restoredMetadata = inspectImageFile(copy.uri);
+            resultUri.current = copy.uri;
+            setResult({ ...restored.options, ...restoredMetadata, uri: copy.uri, size: copy.size });
+            setFormat(restored.options.format);
+            setTargetKb(restored.options.targetKb || ''); setMaxWidth(restored.options.maxWidth || '');
+            setRotation([0, 90, 180, 270].includes(restored.options.rotation) ? restored.options.rotation : 0);
+          } catch (error) { removeWorkingFile(copy.uri); throw error; }
+        }
+        if (alive) setSource(metadata);
       } catch (e) {
         if (alive) setError(e instanceof ImageOperationError ? e.message : 'This image could not be opened. It may be corrupt or an unsupported format on this device.');
       }
     })();
-    return () => { alive = false; cancelled.current = true; clearTemps(); dropResult(); };
+    return () => { alive = false; cancelled.current = true; autosave.flush().finally(() => { clearTemps(); if (resultUri.current) { try { new File(resultUri.current).delete(); } catch {} } }); };
   }, [doc.uri]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', state => { if (state !== 'active') cancelled.current = true; });
+    return () => subscription.remove();
+  }, []);
 
   useEffect(() => { onDirtyChange?.(!!result); }, [result, onDirtyChange]);
 
-  const setWorking = (value) => { setBusy(value); onBusyChange?.(value); };
+  const setWorking = (value) => { locked.current = value; setBusy(value); onBusyChange?.(value); };
 
   async function process() {
-    if (busy || !source) return;
+    if (locked.current || !source) return;
     setError('');
     setNotice('');
-    dropResult();
-    clearTemps();
     cancelled.current = false;
     setWorking(true);
     setProgress('Preparing image...');
+    const resources = [];
+    const previousUri = resultUri.current;
+    let input;
     try {
+      await autosave.flush();
+      clearTemps(previousUri);
+      ensureWorkingSpace(48 * 1024 * 1024);
+      input = await loadBoundedImage(doc.uri);
+      if (cancelled.current) throw new ImageOperationError('CANCELLED', 'Compression cancelled.');
       const meta = formatFor(format);
       const formatKey = SaveFormat[meta.key.toUpperCase()];
       // After a 90/270 rotation the width becomes the original height.
-      const orientedWidth = rotation % 180 === 0 ? source.width : source.height;
+      const orientedWidth = rotation % 180 === 0 ? input.width : input.height;
       // Honor an explicit max width as the cap; otherwise start from full resolution.
       const startWidth = resolveMaxWidth(maxWidth, orientedWidth) || orientedWidth;
       const hasTarget = !!targetKb.trim();
       const target = hasTarget ? targetBytes(targetKb) : null;
 
-      // Always start from the untouched original so we never recompress a prior lossy export.
+      // Decode once with a native size bound, then start every attempt from that
+      // immutable image reference. Never recompress a prior lossy output.
       const renderAt = async (width) => {
-        const context = ImageManipulator.manipulate(doc.uri);
+        const context = ImageManipulator.manipulate(input.ref);
+        resources.push(context);
         if (rotation) context.rotate(rotation);
         if (width < orientedWidth) context.resize({ width });
         const ref = await context.renderAsync();
+        resources.push(ref);
         guardDimensions(ref.width, ref.height);
         return ref;
       };
@@ -122,7 +158,11 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
           if (meta.lossy) {
             const found = await searchQuality({
               targetBytes: target,
-              measure: async (q) => (await encode(ref, q)).size,
+              measure: async (q) => {
+                const probe = await encode(ref, q);
+                try { return probe.size; }
+                finally { new File(probe.uri).delete(); temps.current.delete(probe.uri); }
+              },
               shouldCancel: () => cancelled.current,
             });
             quality = found.quality;
@@ -132,38 +172,47 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
           if (i > 0) downscaled = true;
           // Keep the smallest result as the honest fallback if nothing ever fits.
           if (!chosen || candidate.size < chosen.size) chosen = candidate;
-          if (candidate.fits) { chosen = candidate; break; }
+          if (candidate.fits) { chosen = candidate; }
+          clearTemps(chosen.uri, previousUri);
+          // Release decoded pixels between resolution attempts, not at GC's discretion.
+          while (resources.length) resources.pop().release?.();
+          if (candidate.fits) break;
         }
       }
 
       if (cancelled.current) throw new ImageOperationError('CANCELLED', 'Compression cancelled.');
       clearTemps(chosen.uri);
       resultUri.current = chosen.uri;
-      setResult({ uri: chosen.uri, size: chosen.size, width: chosen.width, height: chosen.height, quality: chosen.quality, fits: chosen.fits });
+      setResult({ uri: chosen.uri, size: chosen.size, width: chosen.width, height: chosen.height, quality: chosen.quality, fits: chosen.fits,
+        format, targetKb: hasTarget ? targetKb.trim() : '', maxWidth, rotation });
       if (hasTarget && !chosen.fits) {
         setNotice(meta.lossy
-          ? 'Even at the lowest quality and smallest size, this could not reach the target. This is the smallest possible result. Try a larger target.'
+          ? 'None of the tested quality and resolution settings reached the target. This is the smallest result tested. Try a larger target.'
           : 'PNG is lossless. Even after downscaling it did not reach the target. Switch to JPG or WebP for smaller files.');
       } else if (hasTarget && downscaled) {
         setNotice('Reached your target by reducing the resolution as well as the quality.');
       }
     } catch (e) {
-      clearTemps();
-      if (e instanceof ImageOperationError && e.code === 'CANCELLED') setNotice('Cancelled. Nothing was changed.');
+      clearTemps(previousUri);
+      if (e instanceof ImageOperationError && e.code === 'CANCELLED') setNotice(previousUri ? 'Cancelled. Your previous preview is still ready to save.' : 'Cancelled. Nothing was changed.');
       else setError(e instanceof ImageOperationError ? e.message : (e.message || 'Could not process this image.'));
     } finally {
+      while (resources.length) resources.pop().release?.();
+      input?.ref.release();
+      Image.clearMemoryCache().catch(() => {});
       setWorking(false);
       setProgress('');
     }
   }
 
   async function save() {
-    if (busy || !result) return;
+    if (locked.current || !result) return;
     setWorking(true);
     try {
-      await onExport({ uri: result.uri, name: outputName(doc.name, format), mimeType: formatFor(format).mimeType });
+      const saved = await onExport({ uri: result.uri, name: outputName(doc.name, result.format), mimeType: formatFor(result.format).mimeType });
+      await autosave.clear();
       dropResult(); // Parent has copied it into Exports; the working file is no longer needed.
-      setNotice('Saved a copy. Adjust settings and process again to make another.');
+      setNotice(saved?.saveMessage || 'Your copy is in Exports.');
     } catch (e) {
       setError(e.message || 'Could not export the image.');
     } finally {
@@ -178,6 +227,7 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
   return <ScrollView style={styles.root} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
     <Text style={styles.title}>Image studio</Text>
     <Text style={styles.muted}>{formatSize(doc.size)} original{source ? ` / ${source.width}x${source.height}` : ''}. Compress and convert without touching the original.</Text>
+    {!!source && (source.width > WORKING_IMAGE_EDGE || source.height > WORKING_IMAGE_EDGE) && <Text style={styles.warn}>This large image is sampled to at most {WORKING_IMAGE_EDGE} pixels on its longest edge for safe processing. The original file stays unchanged.</Text>}
 
     {!!error && <View accessibilityRole="alert" style={styles.errorBox}><Text style={styles.error}>{error}</Text></View>}
 
@@ -190,7 +240,7 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
     </View>
     {transparencyWarning && <Text style={styles.warn}>JPG has no transparency; transparent areas become solid. Use PNG or WebP to keep transparency.</Text>}
     {!meta.lossy && <Text style={styles.warn}>PNG is lossless. To shrink it, reduce the max width. JPG or WebP reach small target sizes better.</Text>}
-    <Text style={styles.warn}>Only the first frame of animated images is kept, and camera metadata (EXIF, location) is not carried over.</Text>
+    <Text style={styles.warn}>Use static images. Animated formats are rejected for safe processing. Camera metadata (EXIF, location) is not carried over to processed copies.</Text>
 
     <Text style={styles.label}>Target size (KB, optional)</Text>
     <TextInput accessibilityLabel="Target size in kilobytes" style={styles.input} value={targetKb} onChangeText={setTargetKb}
@@ -212,41 +262,43 @@ export default function ImageEditor({ doc, onExport, onBusyChange, onDirtyChange
       <Pressable accessibilityRole="button" onPress={() => { cancelled.current = true; }} style={styles.cancel}><Text style={styles.white}>Cancel</Text></Pressable></View> :
       <Pressable accessibilityRole="button" disabled={!source} onPress={process} style={[styles.primary, !source && { opacity: 0.5 }]}><Text style={styles.white}>Process image</Text></Pressable>}
 
+    {!!autosave.status && <Text accessibilityLiveRegion="polite" style={styles.notice}>{autosave.status}</Text>}
     {!!notice && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
 
     {result && <View style={styles.resultBox}>
       <Text style={styles.resultTitle}>Result</Text>
-      <Image accessibilityLabel="Processed image preview" source={{ uri: result.uri }} style={styles.preview} resizeMode="contain" />
-      <Text style={styles.resultLine}>{formatSize(result.size)} / {result.width}x{result.height} / {FORMATS[format].label}</Text>
-      <Text style={styles.muted}>{savings !== null && savings > 0 ? `${savings}% smaller than the original.` : savings !== null && savings < 0 ? `${-savings}% larger than the original.` : 'Similar size to the original.'}{meta.lossy ? ` Quality ${Math.round(result.quality * 100)}%.` : ''}</Text>
-      {targetKb.trim() && result.fits && <Text style={styles.ok}>At or below your {targetKb.trim()} KB target.</Text>}
+      <Image accessibilityLabel="Processed image preview" source={{ uri: result.uri }} style={styles.preview} contentFit="contain" cachePolicy="none" allowDownscaling />
+      <Text style={styles.resultLine}>{formatSize(result.size)} / {result.width}x{result.height} / {FORMATS[result.format].label}</Text>
+      <Text style={styles.muted}>{savings !== null && savings > 0 ? `${savings}% smaller than the original.` : savings !== null && savings < 0 ? `${-savings}% larger than the original.` : 'Similar size to the original.'}{FORMATS[result.format].lossy ? ` Quality ${Math.round(result.quality * 100)}%.` : ''}</Text>
+      {result.targetKb && result.fits && <Text style={styles.ok}>At or below the processed {result.targetKb} KB target.</Text>}
+      {(result.format !== format || result.targetKb !== targetKb.trim() || result.rotation !== rotation || result.maxWidth !== maxWidth) && <Text style={styles.warn}>Settings changed. Process again to apply them; Save keeps the preview above.</Text>}
       <Pressable accessibilityRole="button" disabled={busy} onPress={save} style={styles.primary}><Text style={styles.white}>Save a copy</Text></Pressable>
     </View>}
 
-    <Text style={styles.footnote}>Larger output does not restore detail. Target size means at or below the limit; when that is impossible the smallest result is kept and reported.</Text>
+    <Text style={styles.footnote}>Larger output does not restore detail. Target size means at or below the limit. If no tested setting fits, the smallest tested result is kept and reported.</Text>
   </ScrollView>;
 }
 
 function makeStyles(t) {
   return StyleSheet.create({
-    root: { flex: 1, backgroundColor: t.bg }, content: { padding: 18, gap: 10, paddingBottom: 40 },
-    title: { color: t.text, fontSize: 19, fontWeight: '700' }, muted: { color: t.textMuted, fontSize: 12, lineHeight: 19 },
-    label: { color: t.text, fontSize: 13, fontWeight: '600', marginTop: 8 },
-    row: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-    chip: { minHeight: 44, paddingHorizontal: 16, justifyContent: 'center', borderRadius: 10, backgroundColor: t.chip },
-    chipOn: { backgroundColor: t.chipOn }, chipText: { color: t.chipText, fontWeight: '600' }, chipTextOn: { color: t.chipTextOn },
-    input: { minHeight: 48, backgroundColor: t.surface, borderRadius: 12, paddingHorizontal: 14, color: t.text, borderWidth: 1, borderColor: t.border },
-    warn: { color: t.warn, fontSize: 12, lineHeight: 18 },
-    primary: { backgroundColor: t.primary, borderRadius: 14, padding: 15, alignItems: 'center', minHeight: 50, marginTop: 6, justifyContent: 'center' },
-    white: { color: t.primaryText, fontWeight: '700' },
-    progress: { alignItems: 'center', gap: 12, paddingVertical: 14 },
-    cancel: { backgroundColor: t.surfaceAlt, borderRadius: 10, paddingHorizontal: 20, paddingVertical: 12, minHeight: 44, justifyContent: 'center' },
-    notice: { color: t.textMuted, fontSize: 13, lineHeight: 20 },
-    resultBox: { backgroundColor: t.surface, borderRadius: 14, padding: 14, gap: 8, borderWidth: 1, borderColor: t.border, marginTop: 6 },
-    resultTitle: { color: t.text, fontWeight: '700', fontSize: 15 }, resultLine: { color: t.text, fontWeight: '600' },
-    preview: { width: '100%', height: 200, backgroundColor: t.overlayViewer, borderRadius: 10 },
-    ok: { color: t.success, fontSize: 12, fontWeight: '600' },
-    errorBox: { padding: 12, backgroundColor: t.dangerBg, borderRadius: 10 }, error: { color: t.danger, lineHeight: 20 },
-    footnote: { color: t.textFaint, fontSize: 11, lineHeight: 17, marginTop: 10 },
+    root: { flex: 1, backgroundColor: t.bg }, content: { padding: space.lg, gap: space.sm, paddingBottom: space.xxl, width: '100%', maxWidth: 760, alignSelf: 'center' },
+    title: { ...type.title, color: t.text }, muted: { ...type.caption, color: t.textMuted },
+    label: { ...type.label, color: t.text, marginTop: space.sm },
+    row: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm },
+    chip: { minHeight: 44, paddingHorizontal: space.lg, justifyContent: 'center', borderRadius: radius.sm, backgroundColor: t.chip },
+    chipOn: { backgroundColor: t.chipOn }, chipText: { ...type.label, color: t.chipText }, chipTextOn: { color: t.chipTextOn },
+    input: { minHeight: 48, backgroundColor: t.surface, borderRadius: radius.sm, paddingHorizontal: space.md, color: t.text, borderWidth: hairline, borderColor: t.border, ...type.body },
+    warn: { ...type.caption, color: t.warn },
+    primary: { backgroundColor: t.primary, borderRadius: radius.md, padding: space.md, alignItems: 'center', minHeight: 48, marginTop: space.xs, justifyContent: 'center' },
+    white: { ...type.label, color: t.primaryText },
+    progress: { alignItems: 'center', gap: space.md, paddingVertical: space.md },
+    cancel: { backgroundColor: t.surfaceAlt, borderRadius: radius.sm, paddingHorizontal: space.xl, paddingVertical: space.md, minHeight: 44, justifyContent: 'center' },
+    notice: { ...type.caption, color: t.textMuted },
+    resultBox: { backgroundColor: t.surface, borderRadius: radius.md, padding: space.lg, gap: space.sm, borderWidth: hairline, borderColor: t.border, marginTop: space.xs },
+    resultTitle: { ...type.heading, color: t.text }, resultLine: { ...type.label, color: t.text },
+    preview: { width: '100%', height: 200, backgroundColor: t.overlayViewer, borderRadius: radius.sm },
+    ok: { ...type.caption, color: t.success, fontWeight: '600' },
+    errorBox: { padding: space.md, backgroundColor: t.dangerBg, borderRadius: radius.sm }, error: { ...type.caption, color: t.danger },
+    footnote: { ...type.caption, color: t.textFaint, marginTop: space.sm },
   });
 }

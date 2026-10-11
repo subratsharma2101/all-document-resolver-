@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import { PanResponder, Pressable, StyleSheet, Text, View } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
 import { MAX_SIGNATURE_POINTS, MAX_SIGNATURE_STROKES } from './pdfOperations.cjs';
-import { useTheme } from './theme';
+import { useTheme, hairline, radius, space, type } from './theme';
 
 export default function SignaturePad({ value, onChange, disabled = false }) {
   const { theme } = useTheme();
@@ -67,10 +67,10 @@ export default function SignaturePad({ value, onChange, disabled = false }) {
 
 function makeStyles(t) {
   return StyleSheet.create({
-    root: { gap: 8 }, label: { color: t.text, fontSize: 13, fontWeight: '600' },
-    pad: { width: '100%', aspectRatio: 2.5, maxHeight: 180, backgroundColor: '#f6f7fa', borderRadius: 12, overflow: 'hidden', borderWidth: 1, borderColor: t.border },
-    footer: { flexDirection: 'row', alignItems: 'center', gap: 12 }, hint: { flex: 1, color: t.textMuted, fontSize: 12, lineHeight: 17 },
-    clear: { minHeight: 44, justifyContent: 'center', paddingHorizontal: 16, borderRadius: 10, backgroundColor: t.surfaceAlt },
-    clearText: { color: t.text, fontWeight: '600' }, disabled: { opacity: 0.5 },
+    root: { gap: space.sm }, label: { ...type.label, color: t.text },
+    pad: { width: '100%', aspectRatio: 2.5, maxHeight: 180, backgroundColor: '#ffffff', borderRadius: radius.md, overflow: 'hidden', borderWidth: hairline, borderColor: t.border },
+    footer: { flexDirection: 'row', alignItems: 'center', gap: space.md }, hint: { flex: 1, ...type.caption, color: t.textMuted },
+    clear: { minHeight: 44, justifyContent: 'center', paddingHorizontal: space.lg, borderRadius: radius.sm, backgroundColor: t.surfaceAlt },
+    clearText: { ...type.label, color: t.text }, disabled: { opacity: 0.5 },
   });
 }

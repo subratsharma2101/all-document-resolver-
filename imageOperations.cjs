@@ -4,7 +4,7 @@
 // KB contract: 1 KB = 1000 bytes, consistent with formatSize in fileUtils.cjs.
 const KB = 1000;
 const MAX_TARGET_KB = 25 * 1000; // 25 MB ceiling; larger targets are meaningless here.
-const MAX_MEGAPIXELS = 80;       // Decoded-pixel guard against out-of-memory renders.
+const MAX_MEGAPIXELS = 80;       // Header validation cap; actual decode is separately sampled.
 const MAX_OUTPUT_DIMENSION = 12000;
 
 const FORMATS = {

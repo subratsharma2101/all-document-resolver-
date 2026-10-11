@@ -3,18 +3,22 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import { File } from 'expo-file-system';
 import PdfViewer from './PdfViewer';
 import SignaturePad from './SignaturePad';
-import { useTheme } from './theme';
-import { newWorkingFile, pickDocument, removeWorkingFile } from './fileService';
+import { useTheme, hairline, radius, space, type } from './theme';
+import { ensureWorkingSpace, newWorkingFile, pickDocument, removeWorkingFile } from './fileService';
+import { trimHistory } from './historyPolicy.cjs';
 import { copyName } from './fileUtils.cjs';
-import { applyPdfOperation, inspectPdf, MAX_PDF_PAGES, PdfOperationError } from './pdfOperations.cjs';
+import { applyPdfOperation, inspectPdf, MAX_PDF_PAGES, PdfOperationError, detectImageFormat } from './pdfOperations.cjs';
+import { readDraft } from './draftStorage';
+import useDraftAutosave from './useDraftAutosave';
 
-const MAX_HISTORY = 20;
 const TOOLS = [{ key: 'text', label: 'Text' }, { key: 'whiteout', label: 'Whiteout' }, { key: 'image', label: 'Image' }, { key: 'highlight', label: 'Highlight' }, { key: 'signature', label: 'Signature' }];
 
-export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }) {
+export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange, onDraftChange, onDraftStored }) {
   const { theme } = useTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  const [restored] = useState(() => readDraft(doc));
   const [workingUri, setWorkingUri] = useState(doc.uri);
+  const [savedVersion, setSavedVersion] = useState(null);
   const [info, setInfo] = useState(null); // { pageCount, pages, warnings }
   const [page, setPage] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -35,8 +39,11 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
   const undo = useRef([]);
   const redo = useRef([]);
   const owned = useRef(new Set()); // Working files we created, for cleanup. Never includes doc.uri.
+  const locked = useRef(false);
+  const sizes = useRef(new Map([[doc.uri, doc.size]]));
 
-  const dirty = workingUri !== doc.uri;
+  const dirty = workingUri !== doc.uri && workingUri !== savedVersion?.uri;
+  const autosave = useDraftAutosave({ doc, dirty, revision: workingUri, snapshot: { uri: workingUri }, restored, onDraftChange, onDraftStored });
   useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
 
   // Inspect the original once. Blocks encrypted/signed/form PDFs before any editing UI is usable.
@@ -44,30 +51,36 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
     let alive = true;
     (async () => {
       try {
-        const bytes = await new File(doc.uri).bytes();
+        const bytes = await new File(restored?.uri || doc.uri).bytes();
         const described = await inspectPdf(bytes);
-        if (alive) setInfo(described);
+        if (alive) {
+          if (restored) setWorkingUri(writeWorking(bytes));
+          setInfo(described);
+        }
       } catch (e) {
         if (alive) setError(e instanceof PdfOperationError ? e.message : 'This PDF could not be opened for editing.');
       }
     })();
     return () => {
       alive = false;
-      for (const uri of owned.current) removeWorkingFile(uri);
+      autosave.flush().finally(() => { for (const uri of owned.current) removeWorkingFile(uri); });
     };
   }, [doc.uri]);
 
-  const setWorking = (value) => { setBusy(value); onBusyChange?.(value); };
+  const setWorking = (value) => { locked.current = value; setBusy(value); onBusyChange?.(value); };
 
   function writeWorking(bytes) {
+    ensureWorkingSpace(bytes.byteLength);
     const file = newWorkingFile(doc.name);
-    file.write(bytes);
     owned.current.add(file.uri);
+    try { file.write(bytes); }
+    catch (error) { forget(file.uri); throw error; }
+    sizes.current.set(file.uri, bytes.byteLength);
     return file.uri;
   }
 
   function forget(uri) {
-    if (uri !== doc.uri && owned.current.has(uri)) { removeWorkingFile(uri); owned.current.delete(uri); }
+    if (uri !== doc.uri && owned.current.has(uri)) { removeWorkingFile(uri); owned.current.delete(uri); sizes.current.delete(uri); }
   }
 
   function pushHistory(previousUri) {
@@ -75,20 +88,24 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
     // Discard the redo branch; its files are no longer reachable.
     for (const uri of redo.current) forget(uri);
     redo.current = [];
-    while (undo.current.length > MAX_HISTORY) forget(undo.current.shift());
+    boundHistory();
   }
 
-  async function refreshInfo(uri) {
-    const bytes = await new File(uri).bytes();
-    setInfo(await inspectPdf(bytes));
+  function boundHistory() {
+    const trimmed = trimHistory([...redo.current, ...undo.current], uri => sizes.current.get(uri) ?? new File(uri).size);
+    const kept = new Set(trimmed.keep);
+    undo.current = undo.current.filter(uri => kept.has(uri));
+    redo.current = redo.current.filter(uri => kept.has(uri));
+    for (const uri of trimmed.discard) forget(uri);
   }
 
   async function run(operation) {
-    if (busy || !info) return;
+    if (locked.current || !info) return;
     setError('');
     setNotice('');
     setWorking(true);
     try {
+      await autosave.flush();
       const bytes = await new File(workingUri).bytes();
       const result = await applyPdfOperation(bytes, operation);
       const uri = writeWorking(result.bytes);
@@ -105,15 +122,19 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
   }
 
   async function step(fromStack, toStack) {
-    if (busy || !fromStack.current.length) return;
+    if (locked.current || !fromStack.current.length) return;
     setWorking(true);
     setError('');
     try {
-      const target = fromStack.current.pop();
+      await autosave.flush();
+      const target = fromStack.current[fromStack.current.length - 1];
+      const restored = await inspectPdf(await new File(target).bytes());
+      fromStack.current.pop();
       toStack.current.push(workingUri);
+      boundHistory();
       setWorkingUri(target);
-      await refreshInfo(target);
-      setPage(1);
+      setInfo(restored);
+      setPage(current => Math.min(current, restored.pageCount));
       setNotice(fromStack === undo ? 'Reverted the last change.' : 'Reapplied the change.');
     } catch (e) {
       setError(e.message || 'Could not change history.');
@@ -123,47 +144,45 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
   }
 
   async function merge() {
-    if (busy) return;
+    if (locked.current) return;
+    setWorking(true);
     setError('');
     setNotice('');
     let picked;
     try {
       picked = await pickDocument('pdf');
+      if (!picked) return;
+      const additionalBytes = await new File(picked.uri).bytes();
+      setWorking(false);
+      await run({ type: 'merge', additionalBytes });
     } catch (e) {
       setError(e.message || 'Could not open that PDF.');
-      return;
-    }
-    if (!picked) return;
-    try {
-      const additionalBytes = await new File(picked.uri).bytes();
-      await run({ type: 'merge', additionalBytes });
     } finally {
-      removeWorkingFile(picked.uri);
+      if (picked) removeWorkingFile(picked.uri);
+      setWorking(false);
     }
   }
 
   // Pick a PNG/JPG to stamp onto a page. We read the bytes now and hold them in
   // state; the actual placement waits for the user to tap the page.
   async function pickStamp() {
-    if (busy) return;
+    if (locked.current) return;
+    setWorking(true);
     setError('');
     setNotice('');
     let picked;
     try {
       picked = await pickDocument('image');
-    } catch (e) {
-      setError(e.message || 'Could not open that image.');
-      return;
-    }
-    if (!picked) return;
-    try {
+      if (!picked) return;
       const bytes = await new File(picked.uri).bytes();
+      detectImageFormat(bytes);
       setStamp({ bytes, name: picked.name });
       setNotice(`Image ready: ${picked.name}. Now tap the page to place it.`);
     } catch (e) {
       setError(e.message || 'Could not read that image.');
     } finally {
-      removeWorkingFile(picked.uri);
+      if (picked) removeWorkingFile(picked.uri);
+      setWorking(false);
     }
   }
 
@@ -186,11 +205,13 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
   }
 
   async function save() {
-    if (busy || !info) return;
+    if (locked.current || !info || savedVersion?.uri === workingUri) return;
     setWorking(true);
     try {
-      await onExport({ uri: workingUri, name: copyName(doc.name), mimeType: 'application/pdf' });
-      setNotice('Saved a copy to Exports. Keep editing or export it to a folder.');
+      const saved = await onExport({ uri: workingUri, name: copyName(doc.name), mimeType: 'application/pdf' });
+      setSavedVersion({ uri: workingUri, phone: saved?.saveStatus === 'saved' });
+      await autosave.clear();
+      setNotice(saved?.saveMessage || 'Your copy is in Exports.');
     } catch (e) {
       setError(e.message || 'Could not export the PDF.');
     } finally {
@@ -212,6 +233,7 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
     </View>
 
     <ScrollView style={styles.controls} contentContainerStyle={styles.controlsContent} keyboardShouldPersistTaps="handled">
+      {!!autosave.status && <Text accessibilityLiveRegion="polite" style={styles.notice}>{autosave.status}</Text>}
       {!!error && info && <View accessibilityRole="alert" style={styles.errorBox}><Text style={styles.error}>{error}</Text></View>}
       {!!notice && <Text accessibilityLiveRegion="polite" style={styles.notice}>{notice}</Text>}
 
@@ -224,7 +246,7 @@ export default function PdfEditor({ doc, onExport, onBusyChange, onDirtyChange }
         <View style={styles.row}>
           <Action styles={styles} label="Undo" disabled={busy || !undo.current.length} onPress={() => step(undo, redo)} />
           <Action styles={styles} label="Redo" disabled={busy || !redo.current.length} onPress={() => step(redo, undo)} />
-          <Action styles={styles} label={busy ? 'Working...' : 'Save a copy'} primary disabled={busy} onPress={save} />
+          <Action styles={styles} label={busy ? 'Working...' : savedVersion?.uri === workingUri ? (savedVersion.phone ? 'Saved' : 'In Exports') : 'Save'} primary disabled={busy || savedVersion?.uri === workingUri} onPress={save} />
         </View>
 
         <Text style={styles.section}>Pages</Text>
@@ -308,27 +330,27 @@ function Chip({ label, on, onPress, disabled, styles }) {
 
 function makeStyles(t) {
   return StyleSheet.create({
-    root: { flex: 1, backgroundColor: t.bg }, previewBox: { height: '42%', backgroundColor: t.overlayViewer, borderBottomWidth: 1, borderColor: t.border },
-    armBanner: { position: 'absolute', top: 8, alignSelf: 'center', backgroundColor: t.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20 },
-    armText: { color: t.primaryText, fontWeight: '700', fontSize: 12 },
-    controls: { flex: 1 }, controlsContent: { padding: 16, gap: 10, paddingBottom: 40 },
+    root: { flex: 1, backgroundColor: t.bg }, previewBox: { height: '42%', backgroundColor: t.overlayViewer, borderBottomWidth: hairline, borderColor: t.border },
+    armBanner: { position: 'absolute', top: space.sm, alignSelf: 'center', backgroundColor: t.primary, paddingHorizontal: space.md, paddingVertical: space.sm, borderRadius: radius.pill },
+    armText: { ...type.caption, color: t.primaryText, fontWeight: '600' },
+    controls: { flex: 1 }, controlsContent: { padding: space.lg, gap: space.sm, paddingBottom: space.xxl, width: '100%', maxWidth: 760, alignSelf: 'center' },
     headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-    title: { color: t.text, fontSize: 18, fontWeight: '700' }, muted: { color: t.textMuted, fontSize: 12 },
-    section: { color: t.primary, fontSize: 11, letterSpacing: 1.4, fontWeight: '700', marginTop: 10 },
-    row: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, alignItems: 'center' },
-    input: { minHeight: 48, backgroundColor: t.surface, borderRadius: 12, paddingHorizontal: 14, color: t.text, borderWidth: 1, borderColor: t.border },
-    smallInput: { minHeight: 44, backgroundColor: t.surface, borderRadius: 10, paddingHorizontal: 12, color: t.text, borderWidth: 1, borderColor: t.border },
-    sizeCol: { flex: 1, gap: 4 }, sizeText: { color: t.text, fontWeight: '600', minWidth: 48, textAlign: 'center' },
-    action: { minHeight: 44, paddingHorizontal: 16, justifyContent: 'center', borderRadius: 10, backgroundColor: t.surfaceAlt },
-    actionText: { color: t.text, fontWeight: '600' },
-    primary: { minHeight: 44, paddingHorizontal: 18, justifyContent: 'center', borderRadius: 10, backgroundColor: t.primary, alignItems: 'center' },
-    primaryText: { color: t.primaryText, fontWeight: '700' },
-    chip: { minHeight: 44, paddingHorizontal: 16, justifyContent: 'center', borderRadius: 10, backgroundColor: t.chip },
-    chipOn: { backgroundColor: t.chipOn }, chipText: { color: t.chipText, fontWeight: '600' }, chipTextOn: { color: t.chipTextOn },
-    hint: { color: t.textMuted, fontSize: 12, lineHeight: 18 }, notice: { color: t.textMuted, fontSize: 13, lineHeight: 20 },
-    warnBox: { marginTop: 12, gap: 6, borderLeftWidth: 2, borderLeftColor: t.primary, paddingLeft: 12 },
-    warn: { color: t.textMuted, fontSize: 11, lineHeight: 17 },
-    center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 12, padding: 20 },
-    errorBox: { padding: 12, backgroundColor: t.dangerBg, borderRadius: 10 }, error: { color: t.danger, lineHeight: 20, textAlign: 'center' },
+    title: { ...type.title, color: t.text }, muted: { ...type.caption, color: t.textMuted },
+    section: { ...type.caption, color: t.textMuted, fontWeight: '600', marginTop: space.md },
+    row: { flexDirection: 'row', flexWrap: 'wrap', gap: space.sm, alignItems: 'center' },
+    input: { minHeight: 48, backgroundColor: t.surface, borderRadius: radius.sm, paddingHorizontal: space.md, color: t.text, borderWidth: hairline, borderColor: t.border, ...type.body },
+    smallInput: { minHeight: 44, backgroundColor: t.surface, borderRadius: radius.sm, paddingHorizontal: space.md, color: t.text, borderWidth: hairline, borderColor: t.border, ...type.body },
+    sizeCol: { flex: 1, gap: space.xs }, sizeText: { ...type.label, color: t.text, minWidth: 48, textAlign: 'center' },
+    action: { minHeight: 44, paddingHorizontal: space.lg, justifyContent: 'center', borderRadius: radius.sm, backgroundColor: t.surfaceAlt, borderWidth: hairline, borderColor: t.border },
+    actionText: { ...type.label, color: t.text },
+    primary: { minHeight: 44, paddingHorizontal: space.lg, justifyContent: 'center', borderRadius: radius.sm, backgroundColor: t.primary, alignItems: 'center' },
+    primaryText: { ...type.label, color: t.primaryText },
+    chip: { minHeight: 44, paddingHorizontal: space.lg, justifyContent: 'center', borderRadius: radius.sm, backgroundColor: t.chip },
+    chipOn: { backgroundColor: t.chipOn }, chipText: { ...type.label, color: t.chipText }, chipTextOn: { color: t.chipTextOn },
+    hint: { ...type.caption, color: t.textFaint }, notice: { ...type.caption, color: t.textMuted },
+    warnBox: { marginTop: space.md, gap: space.xs, borderLeftWidth: 2, borderLeftColor: t.border, paddingLeft: space.md },
+    warn: { ...type.caption, color: t.textFaint },
+    center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.md, padding: space.xl },
+    errorBox: { padding: space.md, backgroundColor: t.dangerBg, borderRadius: radius.sm }, error: { ...type.caption, color: t.danger, textAlign: 'center' },
   });
 }

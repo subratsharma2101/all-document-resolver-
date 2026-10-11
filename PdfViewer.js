@@ -26,13 +26,21 @@ function loadAssets() {
   return assetsPromise;
 }
 
-export default function PdfViewer({ uri, name, initialPage = 1, onPageChange, onPageTap }) {
+export default function PdfViewer({ uri, name, initialPage = 1, onPageChange, onPageTap, jumpTo }) {
   const { theme } = useTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const [html, setHtml] = useState(null);
   const [error, setError] = useState(null);
   const initial = useRef(initialPage);
+  const web = useRef(null);
   initial.current = initialPage;
+  const allowMarks = !!onPageTap;
+
+  useEffect(() => {
+    if (Number.isInteger(jumpTo?.page) && jumpTo.page > 0) {
+      web.current?.injectJavaScript(`window.fileViewerGoToPage?.(${jumpTo.page}); true;`);
+    }
+  }, [jumpTo]);
 
   useEffect(() => {
     let cancelled = false;
@@ -43,15 +51,15 @@ export default function PdfViewer({ uri, name, initialPage = 1, onPageChange, on
         const file = new File(uri);
         if (file.size > LIMITS.pdf) throw new Error('PDF viewing is limited to 25 MiB in this version.');
         const [[lib, worker], base64] = await Promise.all([loadAssets(), file.base64()]);
-        if (!cancelled) setHtml(buildPdfHtml(lib, worker, base64, initial.current, chromeFor(theme)));
+        if (!cancelled) setHtml(buildPdfHtml(lib, worker, base64, initial.current, chromeFor(theme), { allowMarks }));
       } catch (e) { if (!cancelled) setError(e.message || String(e)); }
     })();
     return () => { cancelled = true; };
-  }, [uri, theme]);
+  }, [uri, theme, allowMarks]);
 
   if (error) return <View style={styles.center}><Text style={styles.error}>PDF preview: {error}</Text></View>;
   if (!html) return <View style={styles.center}><ActivityIndicator color={theme.primary} /><Text style={styles.dim}>Loading {name}...</Text></View>;
-  return <WebView key={uri} source={{ html }} originWhitelist={['about:*']}
+  return <WebView ref={web} key={uri} source={{ html }} originWhitelist={['about:*']}
     style={styles.web} javaScriptEnabled domStorageEnabled={false}
     allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
     mixedContentMode="never" setSupportMultipleWindows={false}

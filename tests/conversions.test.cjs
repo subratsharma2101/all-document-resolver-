@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { PDFDocument } = require('pdf-lib');
-const { buildPdfFromText, buildPdfFromImages, detectImageFormat, wrapLines, ConversionError } = require('../conversions.cjs');
+const { buildPdfFromText, buildPdfFromImages, detectImageFormat, resizeForPdf, wrapLines, ConversionError, PDF_IMAGE_MAX_DIMENSION } = require('../conversions.cjs');
 
 const hasCode = code => err => err instanceof ConversionError && err.code === code;
 
@@ -32,6 +32,21 @@ test('wrapLines keeps lines within the max width and hard-splits long words', ()
   for (const line of lines) assert.ok(line.length <= 6, `line "${line}" fits`);
   const longWord = wrapLines('abcdefghijklmnop', font, 12, 60);
   assert.ok(longWord.length > 1, 'an over-long word is split across lines');
+  const following = wrapLines('short abcdefghijklmnop\tend', font, 12, 60);
+  assert.ok(following.every(line => line.length <= 6), 'long words following text also fit');
+  assert.ok(following.every(line => !line.includes('\t')), 'tabs become printable spacing');
+});
+
+test('text PDF rejects invalid font size and correctly expands tabs', async () => {
+  await assert.rejects(buildPdfFromText('hello', { fontSize: NaN }), hasCode('INVALID_FONT_SIZE'));
+  const bytes = await buildPdfFromText('left\tright');
+  assert.equal((await PDFDocument.load(bytes)).getPageCount(), 1);
+});
+
+test('image PDF rejects total encoded input before embedding', async () => {
+  const large = new Uint8Array(9 * 1024 * 1024);
+  large.set(PNG_1x1.subarray(0, 4));
+  await assert.rejects(buildPdfFromImages([large, large, large]), hasCode('INPUT_TOO_LARGE'));
 });
 
 test('buildPdfFromImages makes one page per image', async () => {
@@ -46,6 +61,24 @@ test('buildPdfFromImages rejects an empty list', async () => {
 
 test('buildPdfFromImages rejects a non-image payload', async () => {
   await assert.rejects(() => buildPdfFromImages([Uint8Array.from([1, 2, 3, 4])]), hasCode('UNSUPPORTED_IMAGE'));
+});
+
+test('resizeForPdf caps the longer side of a landscape image to the width', () => {
+  assert.deepEqual(resizeForPdf(4000, 3000), { width: PDF_IMAGE_MAX_DIMENSION });
+});
+
+test('resizeForPdf caps the longer side of a portrait image to the height', () => {
+  assert.deepEqual(resizeForPdf(3000, 4000), { height: PDF_IMAGE_MAX_DIMENSION });
+});
+
+test('resizeForPdf returns null for images already within the limit (never upscales)', () => {
+  assert.equal(resizeForPdf(800, 600), null);
+  assert.equal(resizeForPdf(PDF_IMAGE_MAX_DIMENSION, PDF_IMAGE_MAX_DIMENSION), null);
+});
+
+test('resizeForPdf returns null for invalid dimensions', () => {
+  assert.equal(resizeForPdf(0, 100), null);
+  assert.equal(resizeForPdf(NaN, 100), null);
 });
 
 test('detectImageFormat recognizes PNG and JPEG', () => {
